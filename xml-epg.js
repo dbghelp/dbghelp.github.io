@@ -2,10 +2,20 @@ class XMLEPG{constructor(){this.xmlDoc=null;this.channels=null;this.programs=nul
 async setPlaylistChannels(playlistChannels){this.playlistChannels=playlistChannels}
 async load(urls){if(urls==null||urls.length==0)
 return;this.urls=urls;await this.loadXML(urls);await this.getChannels();await this.getPrograms();await this.sortAndCombine()}
-async loadXML(urls){try{const combinedXMLDoc=document.implementation.createDocument(null,'CombinedEPG',null);for(const url of urls){const response=await fetch(url);if(!response.ok){throw new Error(`Network response was not ok for URL: ${url}`)}
-let xmlText=await response.text();xmlText=xmlText.replace(/&(?!(?:apos|quot|[gl]t|amp);)/g,'&amp;');const xmlDoc=new DOMParser().parseFromString(xmlText,'application/xml');if(xmlDoc.getElementsByTagName('parsererror').length>0){const serializer=new XMLSerializer();const xmlString=serializer.serializeToString(xmlDoc);console.error('Parsed XML with errors:',xmlString);throw new Error('Error parsing XML')}
-const children=xmlDoc.documentElement.children;for(let i=0;i<children.length;i++){combinedXMLDoc.documentElement.appendChild(combinedXMLDoc.importNode(children[i],!0))}}
-this.xmlDoc=combinedXMLDoc}catch(error){console.error('Failed to fetch or parse XML:',error)}}
+async loadFromText(content){if(content==null||content.length==0)
+return;await this.loadXMLFromText(content);await this.getChannels();await this.getPrograms();await this.sortAndCombine()}
+async loadXML(urls){const combinedXMLDoc=document.implementation.createDocument(null,'CombinedEPG',null);for(const url of urls){try{const response=await fetch(url);if(!response.ok){console.warn(`Skipping URL due to network issue: ${url}`);continue}
+let xmlText;const contentType=response.headers.get('Content-Type');if(contentType.includes('application/gzip')||url.endsWith('.gz')){const arrayBuffer=await response.arrayBuffer();const decompressed=await this.decompressGzip(arrayBuffer);xmlText=new TextDecoder('utf-8').decode(decompressed)}else if(contentType.includes('application/zip')||url.endsWith('.zip')){const arrayBuffer=await response.arrayBuffer();xmlText=await this.extractXMLFromZip(arrayBuffer)}else{xmlText=await response.text()}
+if(!xmlText.trim()){console.warn(`Skipping empty XML content from URL: ${url}`);continue}
+xmlText=xmlText.replace(/&(?!(?:apos|quot|[gl]t|amp);)/g,'&amp;');const xmlDoc=new DOMParser().parseFromString(xmlText,'application/xml');if(xmlDoc.getElementsByTagName('parsererror').length>0){const serializer=new XMLSerializer();const xmlString=serializer.serializeToString(xmlDoc);console.error('Parsed XML with errors:',xmlString);console.warn(`Skipping malformed XML from URL: ${url}`);continue}
+const children=xmlDoc.documentElement.children;for(let i=0;i<children.length;i++){combinedXMLDoc.documentElement.appendChild(combinedXMLDoc.importNode(children[i],!0))}}catch(error){console.warn(`Skipping URL due to error: ${url}`,error);continue}}
+this.xmlDoc=combinedXMLDoc}
+async loadXMLFromText(content){let xmlDoc;try{let xmlText=content;if(!xmlText.trim()){console.warn(`Skipping empty XML content`)}
+xmlText=xmlText.replace(/&(?!(?:apos|quot|[gl]t|amp);)/g,'&amp;');xmlDoc=new DOMParser().parseFromString(xmlText,'application/xml');if(xmlDoc.getElementsByTagName('parsererror').length>0){const serializer=new XMLSerializer();const xmlString=serializer.serializeToString(xmlDoc);console.error('Parsed XML with errors:',xmlString);console.warn(`Skipping malformed XML`)}}catch(error){console.warn(`Malformed EPG`,error)}
+this.xmlDoc=xmlDoc}
+async decompressGzip(arrayBuffer){return pako.ungzip(new Uint8Array(arrayBuffer))}
+async extractXMLFromZip(arrayBuffer){const zip=await JSZip.loadAsync(arrayBuffer);for(const fileName of Object.keys(zip.files)){if(fileName.endsWith('.xml')){return await zip.file(fileName).async('text')}}
+console.warn('No XML file found in the ZIP archive')}
 async getChannels(){const channels=this.xmlDoc.querySelectorAll('channel');const channelList=[];channels.forEach(channel=>{const tvgId=channel.getAttribute('id');const displayName=channel.querySelector('display-name');const channelName=displayName?displayName.textContent:'No channel name found';const iconElement=channel.querySelector('icon');const tvgLogo=iconElement?iconElement.getAttribute('src'):'default_tvgLogo.png';channelList.push({tvgId,channelName,tvgLogo})});this.channels=channelList}
 getChanneltvgLogo(tvgId){const channel=this.channels.find(channel=>channel.tvgId===tvgId);return channel?channel.tvgLogo:null}
 async getPrograms(){const programs=this.xmlDoc.querySelectorAll('programme');const programList=[];programs.forEach(prog=>{const titleElement=prog.querySelector('title');const title=titleElement?titleElement.textContent:'No title found';const start=prog.getAttribute('start');const stop=prog.getAttribute('stop');const tvgId=prog.getAttribute('channel');const descElement=prog.querySelector('desc');const iconElement=prog.querySelector('icon');const startDate=new Date(this.parseDate(start));const stopDate=new Date(this.parseDate(stop));const formattedStartTime=this.getDayAndTime(startDate);const duration=this.getDurationInMinutes(startDate,stopDate);const desc=descElement?descElement.textContent:'No description';const icon=iconElement?iconElement.getAttribute('src'):this.getChanneltvgLogo(tvgId);programList.push({tvgId,title,desc,icon,startDate,stopDate,formattedStartTime,duration})});this.programs=programList}
@@ -31,6 +41,22 @@ return match||null}
 close(){clearInterval(this.timelineTimer);this.epgContainer.style.display='none'}
 getDayAndTime(date){const daysOfWeek=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];const dayOfWeek=daysOfWeek[date.getDay()];const options={hour:'2-digit',minute:'2-digit',hour12:!0};const formattedTime=date.toLocaleTimeString([],options);return `${dayOfWeek} ${formattedTime}`}
 getDayAndTimeOfNextBlock(date,num){let mydate=new Date(date);mydate.setMinutes(mydate.getMinutes()+(this.timelineBlockDuration*num));const daysOfWeek=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];const dayOfWeek=daysOfWeek[mydate.getDay()];const options={hour:'2-digit',minute:'2-digit',hour12:!0};const formattedTime=mydate.toLocaleTimeString([],options);return `${dayOfWeek} ${formattedTime}`}
+getTimeshiftLink(channel,prog){let sb=new StringBuilder();sb.append(channel.manifestUrl);switch(!0){case channel.manifestUrl.includes("/out/v1/"):sb.append(this.getOption1(prog));break;case channel.manifestUrl.includes("/vxfmt=dp/"):sb.append(this.getOption2(prog));break;case channel.manifestUrl.includes("/bpk-tv/"):sb.append(this.getOption3(prog));break;default:sb.append(this.getDefaultOption(channel.manifestUrl,prog));break}
+return sb.toString()}
+getOption1(prog){let sb=new StringBuilder();sb.append('?start=');sb.append(this.convertToEpochWithTimezone(prog.startDate));sb.append('&end=');sb.append(this.convertToEpochWithTimezone(prog.stopDate));return sb.toString()}
+getOption2(prog){let sb=new StringBuilder();sb.append('&start_time=');sb.append(this.getISODateStringWithoutMilliseconds(prog.startDate));sb.append('&end_time=');sb.append(this.getISODateStringWithoutMilliseconds(prog.stopDate));return sb.toString()}
+getOption3(prog){let sb=new StringBuilder();sb.append('?begin=');sb.append(this.getCompactISODateString(prog.startDate));sb.append('&end=');sb.append(this.getCompactISODateString(prog.stopDate));return sb.toString()}
+getDefaultOption(manifestUrl,prog){let sb=new StringBuilder();if(manifestUrl.includes("?")){sb.append("&")}else{sb.append("?")}
+sb.append('start=');sb.append(this.convertToEpochWithTimezone(prog.startDate));sb.append('&end=');sb.append(this.convertToEpochWithTimezone(prog.stopDate));return sb.toString()}
+convertToEpochWithTimezone(date){const epochTime=date.getTime();return Math.floor(epochTime/1000)}
+getISODateStringWithoutMilliseconds(date){return date.toISOString().split('.')[0]+"Z"}
+getCompactISODateString(date){const year=date.getUTCFullYear();const month=String(date.getUTCMonth()+1).padStart(2,'0');const day=String(date.getUTCDate()).padStart(2,'0');const hours=String(date.getUTCHours()).padStart(2,'0');const minutes=String(date.getUTCMinutes()).padStart(2,'0');const seconds=String(date.getUTCSeconds()).padStart(2,'0');return `${year}${month}${day}T${hours}${minutes}${seconds}Z`}
+getDownloadCommand(timeshiftLink,prog,licenseKey){let sb=new StringBuilder();sb.append("N_m3u8DL-RE --check-segments-count false \"");sb.append(timeshiftLink);sb.append("\" -M format=mkv --save-name \"");sb.append(prog.title.replace(/[^a-zA-Z0-9 _]/g,'').trim());sb.append("\" ");sb.append(licenseKey&&licenseKey.length>0?licenseKey.map(item=>`--key ${item.keyId}:${item.key}`).join(' '):'');return sb.toString()}
+getSchtasksCommand(downloadCommand,prog){let programName=prog.title.replace(/[^a-zA-Z0-9 _]/g,'').trim();let fileName='download_'+programName.replace(/ /g,'_')+'.bat';let sb=new StringBuilder();sb.append('echo ');sb.append(downloadCommand);sb.append(" -sv best -sa all --save-dir \"%USERPROFILE%\\Videos\"");sb.append(" > ");sb.append("\"%USERPROFILE%\\Videos\\");sb.append(fileName);sb.append("\" & ");sb.append('schtasks /create /sc once ');sb.append(this.schtasksDateTime(prog.stopDate,5));sb.append(" /tn \"Download ");sb.append(programName);sb.append("\" /tr \"cmd /c cd %USERPROFILE%\\Videos & %USERPROFILE%\\Videos\\");sb.append(fileName);sb.append("\"");return sb.toString()}
+getCronjobCommand(downloadCommand,prog){let programName=prog.title.replace(/[^a-zA-Z0-9 _]/g,'').trim();let fileName='download_'+programName.replace(/ /g,'_')+'.sh';let sb=new StringBuilder();sb.append("echo x123x");sb.append(downloadCommand);sb.append(" -sv best -sa all --save-dir \"~/Videos\"x123x");sb.append(" > ");sb.append("~/Videos/");sb.append(fileName);sb.append(" &&  chmod +x ~/Videos/");sb.append(fileName);sb.append(" && (crontab -l 2>/dev/null; echo \"");sb.append(this.cronjobDateTime(prog.stopDate,5));sb.append(" cd ~/Videos && ~/Videos/");sb.append(fileName);sb.append("\") | crontab -");return sb.toString()}
+copyToClipboard(text,name){navigator.clipboard.writeText(text).then(()=>{console.log(name+' command successfully copied to clipboard')}).catch(err=>{console.error('Failed to copy '+name+' command: ',err)})}
+schtasksDateTime(date,minutesToAdd){const newDate=new Date(date.getTime());newDate.setMinutes(newDate.getMinutes()+minutesToAdd);const month=(newDate.getMonth()+1).toString().padStart(2,"0");const day=newDate.getDate().toString().padStart(2,"0");const year=newDate.getFullYear();const hours=newDate.getHours().toString().padStart(2,"0");const minutes=newDate.getMinutes().toString().padStart(2,"0");const sd=`/sd ${day}/${month}/${year}`;const st=`/st ${hours}:${minutes}`;return `${sd} ${st}`}
+cronjobDateTime(date,minutesToAdd){const newDate=new Date(date.getTime());newDate.setMinutes(newDate.getMinutes()+minutesToAdd);const minutes=newDate.getMinutes();const hours=newDate.getHours();const dayOfMonth=date.getDate();const month=date.getMonth()+1;const dayOfWeek=date.getDay();const cronExpression=`${minutes} ${hours} ${dayOfMonth} ${month} ${dayOfWeek}`;return cronExpression}
 async displayAllPrograms(containerId,xmlepgInstanceName){if(this.urls==null||this.urls.length==0){if(this.playlistChannels&&this.channels==null){this.channels=this.playlistChannels;delete this.playlistChannels}
 return}
 this.epgContainer=document.getElementById(containerId);const container=this.epgContainer;let sb=new StringBuilder();let allPrograms=this.channels.map(item=>item.programList).flat();var earliestStartDate=this.earliestStartDate;var latestStopDate=this.latestStopDate;const timelineLength=this.timelineLength;const oneUnitWidth=this.oneUnit*this.timelineBlockDuration;sb.append('<div id="vertical-red-line-container">');sb.append(`<div class="table"><div class="thead"><div class="row"><div class="cell channelBox pinned-timeline">github.com/dbghelp</div>`);const numOfBlocks=timelineLength/this.timelineBlockDuration;for(let i=0;i<numOfBlocks;++i){let daytime=this.getDayAndTimeOfNextBlock(earliestStartDate,i);let day=daytime.substring(0,3);let time=daytime.substring(3);sb.append(`<div class="cell pinned-timeline" style="width:${this.oneUnit * this.timelineBlockDuration}px;"><div class="timelineDay">${day}</div><div class="timelineTime">${time}</div></div>`)}
@@ -40,7 +66,7 @@ var programIndex=0;programs.forEach(program=>{var width=this.oneUnit*program.dur
 sb.append('</div>');++channelIndex});sb.append('</div>');sb.append('<div id="tooltip" style="display:none;position: absolute; color: #FFFFFF; background-color: #333333; padding: 10px; width: 40%; flex-direction: column; z-index: 2000"><div><h2></h2> <p></p> </div> <div style="float:right; white-space: nowrap;"></div> </div>');sb.append('<div id="vertical-red-line"></div>');sb.append('</div>');sb.append(`<button id="close-button" onclick="${xmlepgInstanceName}.close()">Close</button>`);container.innerHTML=sb.toString()}
 async timelineNeedleRender(){this.setTimelineNeedle();const redLine=document.getElementById('vertical-red-line');redLine.scrollIntoView({behavior:'smooth',block:'start',inline:'center'});this.timelineTimer=setInterval(()=>{this.setTimelineNeedle()},30000)}
 async clearTimelineNeedle(){clearInterval(this.timelineTimer)}
-async displayPrograms(containerId,tvgId){this.overlayContainer=document.getElementById(containerId);const container=this.overlayContainer;const channel=this.channels.filter(channel=>channel.tvgId===tvgId)[0];const programs=channel.programList;if(!programs){container.innerHTML=`
+async displayPrograms(containerId,tvgId){const hasManifestUrl=this.channels.some(channel=>channel.manifestUrl);this.overlayContainer=document.getElementById(containerId);const container=this.overlayContainer;const channel=this.channels.filter(channel=>channel.tvgId===tvgId)[0];const programs=channel.programList;if(!programs){container.innerHTML=`
 				<div class="program" style="background-color: '#282c34';" id="''">
 				  <img src="${channel.tvgLogo}" alt="${channel.channelName} logo">
 				  <div class="program-details">
@@ -52,7 +78,7 @@ async displayPrograms(containerId,tvgId){this.overlayContainer=document.getEleme
 				  </div>
 				</div>
 				`;return}
-container.innerHTML=programs.map(prog=>{const now=new Date();const isCurrentProgram=now>=prog.startDate&&now<=prog.stopDate;return `
+container.innerHTML=programs.map(prog=>{var timeshiftLink=hasManifestUrl?this.getTimeshiftLink(channel,prog):null;var downloadCommand=hasManifestUrl?this.getDownloadCommand(timeshiftLink,prog,channel.licenseKey):null;var cronjobCommand=hasManifestUrl?this.getCronjobCommand(downloadCommand,prog):null;var schTasksCommand=hasManifestUrl?this.getSchtasksCommand(downloadCommand,prog):null;const now=new Date();const isCurrentProgram=now>=prog.startDate&&now<=prog.stopDate;return `
         <div class="program" style="background-color: ${isCurrentProgram ? '#5a93a3' : '#282c34'};" id="${isCurrentProgram ? 'now' : ''}">
           <img src="${prog.icon}" alt="${prog.title} thumbnail">
           <div class="program-details">
@@ -61,6 +87,23 @@ container.innerHTML=programs.map(prog=>{const now=new Date();const isCurrentProg
           </div>
 		  <div id="startTime">
 		  ${prog.formattedStartTime}
+		  				  ${hasManifestUrl ? `<br><br><div style="border-radius: 5px; cursor: pointer; transition: background-color 0.3s ease, transform 0.2s ease;"
+onmouseover="this.style.backgroundColor='#61dafb'; this.style.transform='scale(1.05)';"
+onmouseout="this.style.backgroundColor=''; this.style.transform='';"
+class="timeshiftBtn"
+onclick="loadVideo('${timeshiftLink}', '${encodeURIComponent(JSON.stringify(channel.licenseKey))}');">🕒Timeshift</div><div style="border-radius: 5px; cursor: pointer; transition: background-color 0.3s ease, transform 0.2s ease;"
+onmouseover="this.style.backgroundColor='#61dafb'; this.style.transform='scale(1.05)';"
+onmouseout="this.style.backgroundColor=''; this.style.transform='';"
+class="timeshiftBtn"
+onclick="copyToClipboard('${encodeURIComponent(downloadCommand)}', 'Download')">💾Download</div><div style="border-radius: 5px; cursor: pointer; transition: background-color 0.3s ease, transform 0.2s ease;"
+onmouseover="this.style.backgroundColor='#61dafb'; this.style.transform='scale(1.05)';"
+onmouseout="this.style.backgroundColor=''; this.style.transform='';"
+class="timeshiftBtn"
+onclick="copyToClipboard('${encodeURIComponent(cronjobCommand)}', 'Cronjob')">📅Cronjob</div><div style="border-radius: 5px; cursor: pointer; transition: background-color 0.3s ease, transform 0.2s ease;"
+onmouseover="this.style.backgroundColor='#61dafb'; this.style.transform='scale(1.05)';"
+onmouseout="this.style.backgroundColor=''; this.style.transform='';"
+class="timeshiftBtn"
+onclick="copyToClipboard('${encodeURIComponent(schTasksCommand)}', 'Schtasks')">📅Schtasks</div>` : ''}
 		  </div>
         </div>
       `}).join('');setTimeout(()=>{const nowElement=document.getElementById('now');if(nowElement){nowElement.scrollIntoView({behavior:'auto'})}},500)}}
